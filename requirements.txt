@@ -3,3 +3,6 @@ faster-whisper
 torch
 pydub
 numpy
+librosa
+soundfile
+ffmpeg-python
