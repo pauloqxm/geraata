@@ -1,36 +1,25 @@
 # Transcrição de Áudio em PT-BR com Streamlit + faster-whisper
 # -------------------------------------------------------------
-# Requisitos para instalar no ambiente:
+# Como executar localmente:
 #   pip install -r requirements.txt
-#   O requirements.txt já inclui pydub>=0.25.1, pyaudioop (para Python 3.13) e imageio-ffmpeg.
-#
-# Executar local:
 #   streamlit run app.py
 #
-# Dicas de deploy:
-#   • Em hosts sem ffmpeg no sistema, usamos imageio-ffmpeg embutido.
-#   • Se o provedor for muito restritivo, prefira subir WAV/MP3.
+# Deploy (ex.: Streamlit Cloud):
+#   • Inclua este app.py e um requirements.txt compatível (já sugerido).
+#   • Em hosts sem ffmpeg no sistema, usamos o imageio-ffmpeg empacotado.
 
 import os
-import io
-import math
 import time
 import tempfile
 from typing import List, Tuple
 
 import streamlit as st
 import pandas as pd
-
-# IMPORTANTE: não importar pydub no topo em Python 3.13 para evitar erro de audioop.
-# Faremos import preguiçoso dentro da função de conversão.
-# from pydub import AudioSegment  # <- NÃO usar aqui
-# import imageio_ffmpeg           # <- NÃO usar aqui
-
 from faster_whisper import WhisperModel
 
-# Tenta expor o ffmpeg empacotado (imageio-ffmpeg) no PATH, para que o faster-whisper consiga usar
+# Expor o ffmpeg empacotado (imageio-ffmpeg) para o PATH, se disponível
 try:
-    import imageio_ffmpeg, os
+    import imageio_ffmpeg
     _ff = imageio_ffmpeg.get_ffmpeg_exe()
     os.environ["IMAGEIO_FFMPEG_EXE"] = _ff
     os.environ["PATH"] = os.pathsep.join([os.path.dirname(_ff), os.environ.get("PATH", "")])
@@ -64,8 +53,6 @@ st.markdown(f"""
 
 h1, h2, h3, h4, h5 {{ color: var(--primary-2); }}
 
-.sidebar .sidebar-content {{ background: #fff; }}
-
 div.stDownloadButton > button {{
     background: var(--primary);
     color:#fff;
@@ -74,7 +61,6 @@ div.stDownloadButton > button {{
 
 .stProgress > div > div > div > div {{ background-color: var(--primary); }}
 
-/* Cartões simples */
 .card {{
   background: linear-gradient(135deg, #ffffff 0%, #f5f7ff 100%);
   border: 1px solid #e5e7eb;
@@ -120,32 +106,29 @@ def to_vtt(rows: List[dict]) -> str:
 
 
 def convert_to_wav_if_needed(input_bytes: bytes, filename: str) -> Tuple[str, str]:
-    """Salva o upload num arquivo temporário. Se não for wav/mp3/m4a/flac/ogg, tenta converter para wav.
-       Usa imageio-ffmpeg embutido. Retorna caminho do arquivo salvo e extensão."""
+    """Salva o upload num arquivo temporário. Se não for wav/mp3/m4a/flac/ogg/aac, tenta converter para wav
+       com pydub + imageio-ffmpeg empacotado. Retorna caminho do arquivo salvo e extensão."""
     suffix = os.path.splitext(filename)[1].lower()
     tmpdir = tempfile.mkdtemp()
     raw_path = os.path.join(tmpdir, filename)
     with open(raw_path, 'wb') as f:
         f.write(input_bytes)
 
-    # Formatos suportados diretamente pelo faster-whisper (via ffmpeg) se houver no sistema
     if suffix in [".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac"]:
         return raw_path, suffix
 
-    # Import preguiçoso (evita erro de audioop em Python 3.13 se pyaudioop não estiver pronto)
     try:
+        # Import preguiçoso para evitar erro de audioop em Python 3.13
         from pydub import AudioSegment
         import imageio_ffmpeg
-        # Força o caminho do ffmpeg pela lib empacotada
         AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
 
         audio = AudioSegment.from_file(raw_path)
         wav_path = os.path.join(tmpdir, os.path.splitext(filename)[0] + ".wav")
         audio.export(wav_path, format="wav")
         return wav_path, ".wav"
-    except Exception as e:
-        # Se falhar a conversão, devolve o arquivo original.
-        # O processo de transcrição ainda pode tentar abrir via ffmpeg do host.
+    except Exception:
+        # Se falhar, segue com o original; o backend tentará abrir via ffmpeg do host
         return raw_path, suffix
 
 
@@ -153,23 +136,19 @@ def convert_to_wav_if_needed(input_bytes: bytes, filename: str) -> Tuple[str, st
 def load_model(model_name: str, device: str, compute_type: str):
     return WhisperModel(model_name, device=device, compute_type=compute_type)
 
-
 # -----------------------------------
 # Sidebar
 # -----------------------------------
 st.sidebar.header("Configurações")
 
-# Bloqueia modelos muito grandes em ambientes com pouca memória
-low_mem_default = True
-
+# Em cloud com pouca RAM, melhor evitar modelos muito grandes
 model_choices = ["tiny", "base", "small", "medium", "large-v3"]
-if low_mem_default:
-    model_choices = ["tiny", "base", "small", "medium"]
+# Se quiser forçar low-mem como padrão, remova "large-v3" da lista acima
 
 model_name = st.sidebar.selectbox(
     "Modelo",
     model_choices,
-    index=2 if "small" in model_choices else 1
+    index=2  # small
 )
 
 device = st.sidebar.selectbox("Dispositivo", ["cpu", "cuda"], index=0)
@@ -185,7 +164,7 @@ st.sidebar.markdown("""
 
 • Em cloud com pouca RAM, prefira **small** ou **base** + `int8`.  
 • O app injeta o ffmpeg empacotado automaticamente.  
-• Se der erro ao iniciar a transcrição, tente reduzir o `beam size`.
+• Se der erro ao iniciar a transcrição, reduza o `beam size`.
 """)
 
 # -----------------------------------
@@ -216,6 +195,9 @@ if clear_btn:
 if demo_btn and 'results' not in st.session_state:
     st.info("Demo pronta. Use seu próprio áudio para melhores resultados.")
 
+# -----------------------------------
+# Transcrição com barra de progresso real
+# -----------------------------------
 if start_btn:
     if not uploaded:
         st.warning("Envie um arquivo primeiro.")
@@ -229,7 +211,9 @@ if start_btn:
 
             st.success("Tudo pronto. Iniciando transcrição.")
 
+            # Barra de progresso e texto
             progress = st.progress(0)
+            prog_text = st.empty()
             t0 = time.time()
 
             lang = None if language_opt == "Detectar automaticamente" else language_opt
@@ -243,30 +227,24 @@ if start_btn:
             )
 
             rows = []
-            est = max(5.0, (getattr(info, 'duration', 60) or 60) * 0.3)
+            total_dur = float(getattr(info, "duration", 0) or 0)
+            est = max(5.0, total_dur * 0.3)  # fallback de estimativa
 
-            # Barra de progresso baseada no tempo real processado
-progress = progress  # já criado acima
-prog_text = st.empty()
+            for seg in segments_iter:
+                rows.append({
+                    "start": seg.start,
+                    "end": seg.end,
+                    "text": seg.text
+                })
 
-total_dur = float(getattr(info, 'duration', 0) or 0)
+                if total_dur > 0:
+                    p = min(1.0, max(0.0, seg.end / total_dur))
+                    prog_text.text(f"{p*100:.1f}% • {seg.end:.1f}s de {total_dur:.1f}s")
+                else:
+                    p = min(1.0, (time.time() - t0) / est)
+                    prog_text.text(f"{p*100:.1f}% • processando…")
 
-for seg in segments_iter:
-    rows.append({
-        'start': seg.start,
-        'end': seg.end,
-        'text': seg.text
-    })
-
-    if total_dur > 0:
-        p = min(1.0, max(0.0, seg.end / total_dur))
-        prog_text.text(f"{p*100:.1f}% • {seg.end:.1f}s de {total_dur:.1f}s")
-    else:
-        # Fallback se a duração não for conhecida
-        p = min(1.0, (time.time() - t0) / est)
-        prog_text.text(f"{p*100:.1f}% • processando…")
-
-    progress.progress(p)
+                progress.progress(p)
 
             df = pd.DataFrame(rows)
             st.session_state['results'] = {
@@ -281,9 +259,13 @@ for seg in segments_iter:
                     'compute_type': compute_type
                 }
             }
-            st.toast("Transcrição concluída.")
+
+            progress.progress(1.0)
+            prog_text.text("✅ Transcrição concluída.")
+            st.toast("Transcrição concluída com sucesso!")
+
         except RuntimeError as e:
-            st.error("Memória insuficiente para carregar o modelo. Tente 'base' ou 'small' e 'int8'.")
+            st.error("Memória insuficiente. Tente 'base' ou 'small' e 'int8'.")
             st.exception(e)
         except FileNotFoundError as e:
             st.error("Falha ao localizar o ffmpeg. Recarregue a página e tente novamente.")
