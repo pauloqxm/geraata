@@ -1,7 +1,5 @@
 streamlit
 faster-whisper
-ctranslate2
-huggingface-hub
-pydub>=0.25.1
-imageio-ffmpeg
-pandas
+torch
+pydub
+numpy
