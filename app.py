@@ -7,7 +7,11 @@ from typing import List, Tuple
 
 import streamlit as st
 import pandas as pd
-from pydub import AudioSegment
+
+# IMPORTANTE: não importar pydub no topo em Python 3.13 para evitar erro de audioop.
+# Faremos import preguiçoso dentro da função de conversão.
+# from pydub import AudioSegment  # <- NÃO usar aqui
+# import imageio_ffmpeg           # <- NÃO usar aqui
 
 from faster_whisper import WhisperModel
 
@@ -94,25 +98,32 @@ def to_vtt(rows: List[dict]) -> str:
 
 
 def convert_to_wav_if_needed(input_bytes: bytes, filename: str) -> Tuple[str, str]:
-    """Salva o upload num arquivo temporário. Se não for wav/mp3/m4a, tenta converter para wav.
-       Retorna caminho do arquivo salvo e extensão."""
+    """Salva o upload num arquivo temporário. Se não for wav/mp3/m4a/flac/ogg, tenta converter para wav.
+       Usa imageio-ffmpeg embutido. Retorna caminho do arquivo salvo e extensão."""
     suffix = os.path.splitext(filename)[1].lower()
     tmpdir = tempfile.mkdtemp()
     raw_path = os.path.join(tmpdir, filename)
     with open(raw_path, 'wb') as f:
         f.write(input_bytes)
 
-    if suffix in [".wav", ".mp3", ".m4a", ".flac", ".ogg"]:
+    # Formatos suportados diretamente pelo faster-whisper (via ffmpeg) se houver no sistema
+    if suffix in [".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac"]:
         return raw_path, suffix
 
-    # Tenta converter com pydub+ffmpeg
+    # Import preguiçoso (evita erro de audioop em Python 3.13 se pyaudioop não estiver pronto)
     try:
+        from pydub import AudioSegment
+        import imageio_ffmpeg
+        # Força o caminho do ffmpeg pela lib empacotada
+        AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
+
         audio = AudioSegment.from_file(raw_path)
         wav_path = os.path.join(tmpdir, os.path.splitext(filename)[0] + ".wav")
         audio.export(wav_path, format="wav")
         return wav_path, ".wav"
-    except Exception:
-        # Se falhar, retorna original mesmo
+    except Exception as e:
+        # Se falhar a conversão, devolve o arquivo original.
+        # O processo de transcrição ainda pode tentar abrir via ffmpeg do host.
         return raw_path, suffix
 
 
@@ -145,7 +156,8 @@ st.sidebar.markdown("""
 
 • Para máxima qualidade, use large-v3.  
 • Para rodar rápido sem GPU, int8 costuma ser ótimo.  
-• Se seu provedor não tiver ffmpeg, suba WAV/MP3.
+• Se seu provedor não tiver ffmpeg, suba WAV/MP3.  
+• Em Python 3.13, pydub usa o backport `pyaudioop` (já incluso no requirements).
 """)
 
 # -----------------------------------
@@ -155,8 +167,8 @@ st.title("🎙️ Transcrição de Áudio Online")
 st.markdown("Suba um arquivo de áudio e gere a transcrição em minutos.")
 
 uploaded = st.file_uploader(
-    "Selecione um arquivo de áudio",
-    type=["wav", "mp3", "m4a", "flac", "ogg", "aac", "wma", "mp4", "mkv"],
+    "Selecione um arquivo de áudio ou vídeo",
+    type=["wav", "mp3", "m4a", "flac", "ogg", "aac", "wma", "mp4", "mkv", "mov"],
     accept_multiple_files=False
 )
 
@@ -203,9 +215,8 @@ if start_btn:
 
         rows = []
         total = 0
-        # Não temos o total real de segmentos antes, então atualizamos progress de forma contínua pelo tempo
-        # Ex.: assume 3 min por cada 10 min de áudio no CPU small (aproximação visual)
-        est = max(5.0, (info.duration or 60) * 0.3)
+        # Aproximação visual de progresso por tempo
+        est = max(5.0, (getattr(info, 'duration', 60) or 60) * 0.3)
 
         for seg in segments_iter:
             rows.append({
@@ -214,7 +225,6 @@ if start_btn:
                 'text': seg.text
             })
             total += 1
-            # feedback de progresso simples por tempo
             p = min(1.0, (time.time() - t0) / est)
             progress.progress(p)
 
@@ -243,7 +253,8 @@ if 'results' in st.session_state:
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("Duração", f"{res['info']['duration']:.1f}s")
+        dur = res['info'].get('duration')
+        st.metric("Duração", f"{dur:.1f}s" if dur is not None else "-")
     with c2:
         st.metric("Segmentos", f"{len(rows)}")
     with c3:
@@ -298,6 +309,5 @@ if 'results' in st.session_state:
     st.markdown("### Observações")
     st.markdown(
         "Acurácia depende da qualidade do áudio. Para máxima qualidade use o modelo large-v3. "
-        "Se o provedor de hospedagem não tiver ffmpeg, prefira subir arquivos WAV ou MP3."
+        "Se o provedor de hospedagem não tiver ffmpeg, usamos o binário do imageio-ffmpeg."
     )
-
