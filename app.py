@@ -3,7 +3,7 @@ import numpy as np
 from faster_whisper import WhisperModel
 import tempfile
 import os
-from audio2numpy import open_audio
+import librosa
 from pydub import AudioSegment
 import io
 import time
@@ -74,6 +74,7 @@ def convert_audio(input_file, output_format="wav", progress_bar=None, status_tex
         if hasattr(input_file, 'read'):
             if progress_bar:
                 progress_bar.progress(10)
+            # Usa io.BytesIO para arquivos em memória
             audio = AudioSegment.from_file(io.BytesIO(input_file.read()))
         else:
             audio = AudioSegment.from_file(input_file)
@@ -96,7 +97,7 @@ def convert_audio(input_file, output_format="wav", progress_bar=None, status_tex
         
         # Salva em arquivo temporário
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{output_format}") as temp_file:
-            audio.export(temp_file.name, format=output_format)
+            audio.export(temp_file.name, format=output_format, parameters=["-ac", "1", "-ar", "16000"])
         
         if progress_bar:
             progress_bar.progress(100)
@@ -128,18 +129,14 @@ def transcribe_audio(model, audio_path, progress_bar=None, status_text=None):
         if status_text:
             status_text.text("📝 Processando segmentos de áudio...")
         
-        # Coleta todos os segmentos com atualização de progresso
+        # Coleta todos os segmentos
         transcriptions = []
-        total_segments = 0
-        
-        # Primeira passagem para contar segmentos
         segments_list = list(segments)
         total_segments = len(segments_list)
         
         if progress_bar:
             progress_bar.progress(0)
         
-        # Segunda passagem para processar com progresso
         for i, segment in enumerate(segments_list):
             transcriptions.append({
                 'start': segment.start,
@@ -165,8 +162,8 @@ def transcribe_audio(model, audio_path, progress_bar=None, status_text=None):
 # Interface principal
 uploaded_file = st.file_uploader(
     "Faça upload do arquivo de áudio",
-    type=['wav', 'mp3', 'm4a', 'ogg', 'flac', 'aac'],
-    help="Formatos suportados: WAV, MP3, M4A, OGG, FLAC, AAC"
+    type=['wav', 'mp3', 'm4a', 'ogg', 'flac', 'aac', 'webm'],
+    help="Formatos suportados: WAV, MP3, M4A, OGG, FLAC, AAC, WEBM"
 )
 
 # Carrega o modelo
@@ -175,12 +172,6 @@ with st.spinner("Carregando modelo de transcrição..."):
 
 if model is not None and uploaded_file is not None:
     # Mostra informações do arquivo
-    file_details = {
-        "Nome do arquivo": uploaded_file.name,
-        "Tipo do arquivo": uploaded_file.type,
-        "Tamanho do arquivo": f"{uploaded_file.size / 1024 / 1024:.2f} MB"
-    }
-    
     st.subheader("📄 Informações do Arquivo")
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -216,25 +207,20 @@ if model is not None and uploaded_file is not None:
             overall_progress.progress(20)
             
             # Converte o áudio se necessário
-            if not uploaded_file.name.lower().endswith('.wav'):
-                status_text.text("🔄 Convertendo formato de áudio...")
-                converted_path = convert_audio(
-                    temp_audio_path, 
-                    progress_bar=conversion_progress,
-                    status_text=status_text
-                )
-                if converted_path:
-                    audio_path = converted_path
-                    overall_progress.progress(50)
-                else:
-                    st.error("Erro na conversão do áudio")
-                    os.unlink(temp_audio_path)
-                    st.stop()
-            else:
-                audio_path = temp_audio_path
-                conversion_progress.progress(100)
+            status_text.text("🔄 Convertendo formato de áudio...")
+            converted_path = convert_audio(
+                temp_audio_path, 
+                progress_bar=conversion_progress,
+                status_text=status_text
+            )
+            
+            if converted_path:
+                audio_path = converted_path
                 overall_progress.progress(50)
-                status_text.text("✅ Arquivo pronto para transcrição!")
+            else:
+                st.error("Erro na conversão do áudio")
+                os.unlink(temp_audio_path)
+                st.stop()
             
             # Transcreve o áudio
             status_text.text("🎯 Iniciando transcrição...")
@@ -252,7 +238,7 @@ if model is not None and uploaded_file is not None:
             
             # Limpa arquivos temporários
             os.unlink(temp_audio_path)
-            if 'converted_path' in locals() and os.path.exists(converted_path):
+            if os.path.exists(converted_path):
                 os.unlink(converted_path)
         
         except Exception as e:
@@ -280,7 +266,7 @@ if model is not None and uploaded_file is not None:
             # Exibe a transcrição completa
             st.subheader("📝 Transcrição Completa")
             full_text = " ".join([segment['text'] for segment in segments])
-            st.text_area("Texto transcrito:", full_text, height=200)
+            st.text_area("Texto transcrito:", full_text, height=200, key="full_text")
             
             # Exibe segmentos com timestamps
             st.subheader("⏱️ Transcrição com Timestamps")
