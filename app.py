@@ -43,8 +43,13 @@ vad_filter = st.sidebar.checkbox("Filtro VAD", value=True, help="Detecção de a
 def load_model(model_size):
     try:
         # Use GPU se disponível, caso contrário use CPU
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        compute_type = "float16" if device == "cuda" else "int8"
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            compute_type = "float16" if device == "cuda" else "int8"
+        except:
+            device = "cpu"
+            compute_type = "int8"
         
         st.sidebar.info(f"Usando: {device.upper()}")
         
@@ -59,31 +64,58 @@ def load_model(model_size):
         return None
 
 # Função para converter áudio para formato compatível
-def convert_audio(input_file, output_format="wav"):
+def convert_audio(input_file, output_format="wav", progress_bar=None, status_text=None):
     """Converte áudio para formato WAV com taxa de amostragem compatível"""
     try:
+        if status_text:
+            status_text.text("📥 Lendo arquivo de áudio...")
+        
         # Lê o arquivo de áudio
         if hasattr(input_file, 'read'):
+            if progress_bar:
+                progress_bar.progress(10)
             audio = AudioSegment.from_file(io.BytesIO(input_file.read()))
         else:
             audio = AudioSegment.from_file(input_file)
+        
+        if progress_bar:
+            progress_bar.progress(30)
+        
+        if status_text:
+            status_text.text("🔄 Convertendo para mono e 16kHz...")
         
         # Converte para mono e 16kHz (recomendado para Whisper)
         audio = audio.set_channels(1)
         audio = audio.set_frame_rate(16000)
         
+        if progress_bar:
+            progress_bar.progress(60)
+        
+        if status_text:
+            status_text.text("💾 Salvando arquivo convertido...")
+        
         # Salva em arquivo temporário
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{output_format}") as temp_file:
             audio.export(temp_file.name, format=output_format)
-            return temp_file.name
+        
+        if progress_bar:
+            progress_bar.progress(100)
+        
+        if status_text:
+            status_text.text("✅ Conversão concluída!")
+            
+        return temp_file.name
     except Exception as e:
         st.error(f"Erro na conversão do áudio: {e}")
         return None
 
-# Função para transcrever áudio
-def transcribe_audio(model, audio_path):
+# Função para transcrever áudio com progresso
+def transcribe_audio(model, audio_path, progress_bar=None, status_text=None):
     """Transcreve o áudio usando faster-whisper"""
     try:
+        if status_text:
+            status_text.text("🎯 Iniciando transcrição...")
+        
         segments, info = model.transcribe(
             audio_path,
             language="pt",
@@ -93,15 +125,38 @@ def transcribe_audio(model, audio_path):
             vad_filter=vad_filter
         )
         
-        # Coleta todos os segmentos
+        if status_text:
+            status_text.text("📝 Processando segmentos de áudio...")
+        
+        # Coleta todos os segmentos com atualização de progresso
         transcriptions = []
-        for segment in segments:
+        total_segments = 0
+        
+        # Primeira passagem para contar segmentos
+        segments_list = list(segments)
+        total_segments = len(segments_list)
+        
+        if progress_bar:
+            progress_bar.progress(0)
+        
+        # Segunda passagem para processar com progresso
+        for i, segment in enumerate(segments_list):
             transcriptions.append({
                 'start': segment.start,
                 'end': segment.end,
                 'text': segment.text
             })
+            
+            if progress_bar and total_segments > 0:
+                progress = (i + 1) / total_segments
+                progress_bar.progress(progress)
+                
+            if status_text and total_segments > 0:
+                status_text.text(f"📝 Transcrevendo segmento {i+1}/{total_segments}...")
         
+        if status_text:
+            status_text.text("✅ Transcrição concluída!")
+            
         return transcriptions, info
     except Exception as e:
         st.error(f"Erro na transcrição: {e}")
@@ -137,33 +192,78 @@ if model is not None and uploaded_file is not None:
     
     # Botão para iniciar transcrição
     if st.button("🎯 Iniciar Transcrição", type="primary"):
-        with st.spinner("Processando áudio..."):
+        # Container para progresso
+        progress_container = st.container()
+        status_container = st.container()
+        
+        with progress_container:
+            st.subheader("📊 Progresso do Processamento")
+            overall_progress = st.progress(0)
+            conversion_progress = st.progress(0)
+            transcription_progress = st.progress(0)
+            status_text = st.empty()
+        
+        try:
+            # Atualiza progresso geral
+            overall_progress.progress(10)
+            status_text.text("📥 Preparando arquivo...")
+            
             # Salva arquivo temporariamente
             with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{uploaded_file.name}") as tmp_file:
                 tmp_file.write(uploaded_file.getvalue())
                 temp_audio_path = tmp_file.name
             
+            overall_progress.progress(20)
+            
             # Converte o áudio se necessário
             if not uploaded_file.name.lower().endswith('.wav'):
-                converted_path = convert_audio(temp_audio_path)
+                status_text.text("🔄 Convertendo formato de áudio...")
+                converted_path = convert_audio(
+                    temp_audio_path, 
+                    progress_bar=conversion_progress,
+                    status_text=status_text
+                )
                 if converted_path:
                     audio_path = converted_path
+                    overall_progress.progress(50)
                 else:
                     st.error("Erro na conversão do áudio")
                     os.unlink(temp_audio_path)
                     st.stop()
             else:
                 audio_path = temp_audio_path
+                conversion_progress.progress(100)
+                overall_progress.progress(50)
+                status_text.text("✅ Arquivo pronto para transcrição!")
             
             # Transcreve o áudio
+            status_text.text("🎯 Iniciando transcrição...")
             start_time = time.time()
-            segments, info = transcribe_audio(model, audio_path)
+            
+            segments, info = transcribe_audio(
+                model, 
+                audio_path,
+                progress_bar=transcription_progress,
+                status_text=status_text
+            )
+            
             end_time = time.time()
+            overall_progress.progress(100)
             
             # Limpa arquivos temporários
             os.unlink(temp_audio_path)
             if 'converted_path' in locals() and os.path.exists(converted_path):
                 os.unlink(converted_path)
+        
+        except Exception as e:
+            status_text.text("❌ Erro no processamento!")
+            st.error(f"Erro durante o processamento: {e}")
+            # Limpeza em caso de erro
+            if 'temp_audio_path' in locals() and os.path.exists(temp_audio_path):
+                os.unlink(temp_audio_path)
+            if 'converted_path' in locals() and os.path.exists(converted_path):
+                os.unlink(converted_path)
+            st.stop()
         
         if segments and info:
             # Mostra estatísticas
@@ -221,13 +321,15 @@ with st.expander("ℹ️ Instruções de Uso"):
     1. **Faça upload** de um arquivo de áudio nos formatos suportados
     2. **Ajuste as configurações** na barra lateral se necessário
     3. **Clique em 'Iniciar Transcrição'** para processar o áudio
-    4. **Visualize e baixe** o resultado
+    4. **Acompanhe o progresso** nas barras de progresso
+    5. **Visualize e baixe** o resultado
     
     ### Dicas:
     - Para melhor precisão, use áudios com boa qualidade de áudio
     - Modelos maiores ("medium", "large") são mais precisos mas mais lentos
     - O filtro VAD ajuda a remover silêncios desnecessários
     - Arquivos WAV geralmente têm melhor desempenho
+    - A barra de progresso mostra o andamento da conversão e transcrição
     """)
 
 # Rodapé
