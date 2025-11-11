@@ -7,6 +7,8 @@ import librosa
 from pydub import AudioSegment
 import io
 import time
+import subprocess
+import sys
 
 # Configuração da página
 st.set_page_config(
@@ -20,6 +22,47 @@ st.title("🎙️ Transcrição de Áudio em Português Brasileiro")
 st.markdown("""
 Faça upload de um arquivo de áudio e obtenha a transcrição automática em português!
 """)
+
+# Função para verificar se FFmpeg está instalado
+def check_ffmpeg():
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+        subprocess.run(["ffprobe", "-version"], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+# Verifica FFmpeg no início
+ffmpeg_available = check_ffmpeg()
+
+if not ffmpeg_available:
+    st.warning("""
+    ⚠️ **FFmpeg não encontrado!**
+    
+    Para converter arquivos de áudio, é necessário instalar o FFmpeg:
+    
+    **Windows:**
+    ```bash
+    # Usando chocolatey
+    choco install ffmpeg
+    # Ou baixe do site oficial: https://ffmpeg.org/download.html
+    ```
+    
+    **macOS:**
+    ```bash
+    brew install ffmpeg
+    ```
+    
+    **Linux (Ubuntu/Debian):**
+    ```bash
+    sudo apt update && sudo apt install ffmpeg
+    ```
+    
+    **No Streamlit Cloud:** Adicione isso no arquivo `packages.txt`:
+    ```
+    ffmpeg
+    ```
+    """)
 
 # Sidebar com configurações
 st.sidebar.title("Configurações")
@@ -63,6 +106,24 @@ def load_model(model_size):
         st.error(f"Erro ao carregar o modelo: {e}")
         return None
 
+# Função alternativa para converter áudio usando librosa (quando FFmpeg não está disponível)
+def convert_audio_librosa(input_file, output_path):
+    """Converte áudio usando librosa quando FFmpeg não está disponível"""
+    try:
+        # Se for um arquivo upload do Streamlit
+        if hasattr(input_file, 'read'):
+            audio_data, sample_rate = librosa.load(io.BytesIO(input_file.read()), sr=16000, mono=True)
+        else:
+            audio_data, sample_rate = librosa.load(input_file, sr=16000, mono=True)
+        
+        # Salva o arquivo usando soundfile
+        import soundfile as sf
+        sf.write(output_path, audio_data, sample_rate)
+        return output_path
+    except Exception as e:
+        st.error(f"Erro na conversão com librosa: {e}")
+        return None
+
 # Função para converter áudio para formato compatível
 def convert_audio(input_file, output_format="wav", progress_bar=None, status_text=None):
     """Converte áudio para formato WAV com taxa de amostragem compatível"""
@@ -70,11 +131,30 @@ def convert_audio(input_file, output_format="wav", progress_bar=None, status_tex
         if status_text:
             status_text.text("📥 Lendo arquivo de áudio...")
         
-        # Lê o arquivo de áudio
+        # Se FFmpeg não estiver disponível, usa librosa
+        if not ffmpeg_available:
+            if status_text:
+                status_text.text("🔄 Convertendo com librosa (FFmpeg não disponível)...")
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{output_format}") as temp_file:
+                output_path = temp_file.name
+            
+            result_path = convert_audio_librosa(input_file, output_path)
+            
+            if progress_bar:
+                progress_bar.progress(100)
+            
+            if status_text:
+                status_text.text("✅ Conversão concluída com librosa!")
+            
+            return result_path
+        
+        # Se FFmpeg estiver disponível, usa pydub (mais robusto)
         if hasattr(input_file, 'read'):
             if progress_bar:
                 progress_bar.progress(10)
-            # Usa io.BytesIO para arquivos em memória
+            # Reinicia a posição do arquivo
+            input_file.seek(0)
             audio = AudioSegment.from_file(io.BytesIO(input_file.read()))
         else:
             audio = AudioSegment.from_file(input_file)
@@ -97,7 +177,7 @@ def convert_audio(input_file, output_format="wav", progress_bar=None, status_tex
         
         # Salva em arquivo temporário
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{output_format}") as temp_file:
-            audio.export(temp_file.name, format=output_format, parameters=["-ac", "1", "-ar", "16000"])
+            audio.export(temp_file.name, format=output_format)
         
         if progress_bar:
             progress_bar.progress(100)
@@ -181,6 +261,15 @@ if model is not None and uploaded_file is not None:
     with col3:
         st.metric("Tamanho", f"{uploaded_file.size / 1024 / 1024:.2f} MB")
     
+    # Aviso sobre FFmpeg se necessário
+    if not ffmpeg_available and not uploaded_file.name.lower().endswith('.wav'):
+        st.warning("""
+        ⚠️ **FFmpeg não encontrado - usando método alternativo**
+        
+        A conversão de áudio pode ser mais lenta e alguns formatos podem não funcionar perfeitamente.
+        Para melhor experiência, instale o FFmpeg.
+        """)
+    
     # Botão para iniciar transcrição
     if st.button("🎯 Iniciar Transcrição", type="primary"):
         # Container para progresso
@@ -206,10 +295,10 @@ if model is not None and uploaded_file is not None:
             
             overall_progress.progress(20)
             
-            # Converte o áudio se necessário
+            # Sempre converte o áudio para garantir compatibilidade
             status_text.text("🔄 Convertendo formato de áudio...")
             converted_path = convert_audio(
-                temp_audio_path, 
+                uploaded_file,  # Passa o arquivo original
                 progress_bar=conversion_progress,
                 status_text=status_text
             )
@@ -237,7 +326,8 @@ if model is not None and uploaded_file is not None:
             overall_progress.progress(100)
             
             # Limpa arquivos temporários
-            os.unlink(temp_audio_path)
+            if os.path.exists(temp_audio_path):
+                os.unlink(temp_audio_path)
             if os.path.exists(converted_path):
                 os.unlink(converted_path)
         
@@ -310,12 +400,15 @@ with st.expander("ℹ️ Instruções de Uso"):
     4. **Acompanhe o progresso** nas barras de progresso
     5. **Visualize e baixe** o resultado
     
+    ### Requisitos:
+    - **FFmpeg** (recomendado): Para melhor compatibilidade com formatos de áudio
+    - **Sem FFmpeg**: Funciona com métodos alternativos, mas pode ser mais limitado
+    
     ### Dicas:
     - Para melhor precisão, use áudios com boa qualidade de áudio
     - Modelos maiores ("medium", "large") são mais precisos mas mais lentos
     - O filtro VAD ajuda a remover silêncios desnecessários
     - Arquivos WAV geralmente têm melhor desempenho
-    - A barra de progresso mostra o andamento da conversão e transcrição
     """)
 
 # Rodapé
