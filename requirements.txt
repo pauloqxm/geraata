@@ -1,0 +1,5 @@
+streamlit
+faster-whisper
+pydub
+ffmpeg-python
+pandas
