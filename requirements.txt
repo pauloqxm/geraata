@@ -1,7 +1,7 @@
 streamlit
 faster-whisper
-pydub
-pyaudioop
+pydub>=0.25.1
+pyaudioop; python_version >= "3.13"
 imageio-ffmpeg
 pandas
 numpy
