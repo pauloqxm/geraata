@@ -1,7 +1,7 @@
 streamlit
 faster-whisper
 torch
-pydub
-numpy
 librosa
 soundfile
+numpy
+resampy
