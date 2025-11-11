@@ -1,3 +1,16 @@
+# Transcrição de Áudio em PT-BR com Streamlit + faster-whisper
+# -------------------------------------------------------------
+# Requisitos para instalar no ambiente:
+#   pip install -r requirements.txt
+#   O requirements.txt já inclui pydub>=0.25.1, pyaudioop (para Python 3.13) e imageio-ffmpeg.
+#
+# Executar local:
+#   streamlit run app.py
+#
+# Dicas de deploy:
+#   • Em hosts sem ffmpeg no sistema, usamos imageio-ffmpeg embutido.
+#   • Se o provedor for muito restritivo, prefira subir WAV/MP3.
+
 import os
 import io
 import math
@@ -14,6 +27,15 @@ import pandas as pd
 # import imageio_ffmpeg           # <- NÃO usar aqui
 
 from faster_whisper import WhisperModel
+
+# Tenta expor o ffmpeg empacotado (imageio-ffmpeg) no PATH, para que o faster-whisper consiga usar
+try:
+    import imageio_ffmpeg, os
+    _ff = imageio_ffmpeg.get_ffmpeg_exe()
+    os.environ["IMAGEIO_FFMPEG_EXE"] = _ff
+    os.environ["PATH"] = os.pathsep.join([os.path.dirname(_ff), os.environ.get("PATH", "")])
+except Exception:
+    pass
 
 # -----------------------------------
 # UI CONFIG
@@ -137,10 +159,17 @@ def load_model(model_name: str, device: str, compute_type: str):
 # -----------------------------------
 st.sidebar.header("Configurações")
 
+# Bloqueia modelos muito grandes em ambientes com pouca memória
+low_mem_default = True
+
+model_choices = ["tiny", "base", "small", "medium", "large-v3"]
+if low_mem_default:
+    model_choices = ["tiny", "base", "small", "medium"]
+
 model_name = st.sidebar.selectbox(
     "Modelo",
-    ["tiny", "base", "small", "medium", "large-v3"],
-    index=2
+    model_choices,
+    index=2 if "small" in model_choices else 1
 )
 
 device = st.sidebar.selectbox("Dispositivo", ["cpu", "cuda"], index=0)
@@ -149,15 +178,14 @@ compute_type = st.sidebar.selectbox("Precisão", ["int8", "int8_float16", "float
 st.sidebar.subheader("Parâmetros")
 language_opt = st.sidebar.selectbox("Idioma", ["Detectar automaticamente", "pt", "en", "es", "fr"], index=1)
 vad_filter = st.sidebar.checkbox("Ativar VAD (remoção de silêncio)", value=True)
-beam_size = st.sidebar.slider("Beam size", 1, 10, 5)
+beam_size = st.sidebar.slider("Beam size", 1, 10, 3)
 
 st.sidebar.markdown("""
 **Dicas**
 
-• Para máxima qualidade, use large-v3.  
-• Para rodar rápido sem GPU, int8 costuma ser ótimo.  
-• Se seu provedor não tiver ffmpeg, suba WAV/MP3.  
-• Em Python 3.13, pydub usa o backport `pyaudioop` (já incluso no requirements).
+• Em cloud com pouca RAM, prefira **small** ou **base** + `int8`.  
+• O app injeta o ffmpeg empacotado automaticamente.  
+• Se der erro ao iniciar a transcrição, tente reduzir o `beam size`.
 """)
 
 # -----------------------------------
@@ -192,56 +220,62 @@ if start_btn:
     if not uploaded:
         st.warning("Envie um arquivo primeiro.")
     else:
-        with st.status("Preparando o modelo", expanded=False) as status:
-            model = load_model(model_name, device, compute_type)
-            status.update(label="Convertendo áudio se necessário")
-            file_bytes = uploaded.read()
-            audio_path, ext = convert_to_wav_if_needed(file_bytes, uploaded.name)
+        try:
+            with st.status("Preparando o modelo", expanded=False) as status:
+                model = load_model(model_name, device, compute_type)
+                status.update(label="Convertendo áudio se necessário")
+                file_bytes = uploaded.read()
+                audio_path, ext = convert_to_wav_if_needed(file_bytes, uploaded.name)
 
-        st.success("Tudo pronto. Iniciando transcrição.")
+            st.success("Tudo pronto. Iniciando transcrição.")
 
-        progress = st.progress(0)
-        t0 = time.time()
+            progress = st.progress(0)
+            t0 = time.time()
 
-        lang = None if language_opt == "Detectar automaticamente" else language_opt
+            lang = None if language_opt == "Detectar automaticamente" else language_opt
 
-        segments_iter, info = model.transcribe(
-            audio_path,
-            language=lang,
-            vad_filter=vad_filter,
-            beam_size=beam_size,
-            condition_on_previous_text=True
-        )
+            segments_iter, info = model.transcribe(
+                audio_path,
+                language=lang,
+                vad_filter=vad_filter,
+                beam_size=beam_size,
+                condition_on_previous_text=True
+            )
 
-        rows = []
-        total = 0
-        # Aproximação visual de progresso por tempo
-        est = max(5.0, (getattr(info, 'duration', 60) or 60) * 0.3)
+            rows = []
+            est = max(5.0, (getattr(info, 'duration', 60) or 60) * 0.3)
 
-        for seg in segments_iter:
-            rows.append({
-                'start': seg.start,
-                'end': seg.end,
-                'text': seg.text
-            })
-            total += 1
-            p = min(1.0, (time.time() - t0) / est)
-            progress.progress(p)
+            for seg in segments_iter:
+                rows.append({
+                    'start': seg.start,
+                    'end': seg.end,
+                    'text': seg.text
+                })
+                progress.progress(min(1.0, (time.time() - t0) / est))
 
-        df = pd.DataFrame(rows)
-        st.session_state['results'] = {
-            'rows': rows,
-            'df': df,
-            'info': {
-                'duration': info.duration,
-                'language': info.language,
-                'language_probability': getattr(info, 'language_probability', None),
-                'model': model_name,
-                'device': device,
-                'compute_type': compute_type
+            df = pd.DataFrame(rows)
+            st.session_state['results'] = {
+                'rows': rows,
+                'df': df,
+                'info': {
+                    'duration': getattr(info, 'duration', None),
+                    'language': getattr(info, 'language', None),
+                    'language_probability': getattr(info, 'language_probability', None),
+                    'model': model_name,
+                    'device': device,
+                    'compute_type': compute_type
+                }
             }
-        }
-        st.toast("Transcrição concluída.")
+            st.toast("Transcrição concluída.")
+        except RuntimeError as e:
+            st.error("Memória insuficiente para carregar o modelo. Tente 'base' ou 'small' e 'int8'.")
+            st.exception(e)
+        except FileNotFoundError as e:
+            st.error("Falha ao localizar o ffmpeg. Recarregue a página e tente novamente.")
+            st.exception(e)
+        except Exception as e:
+            st.error("Houve um erro durante a execução.")
+            st.exception(e)
 
 # -----------------------------------
 # Resultados
