@@ -245,13 +245,28 @@ if start_btn:
             rows = []
             est = max(5.0, (getattr(info, 'duration', 60) or 60) * 0.3)
 
-            for seg in segments_iter:
-                rows.append({
-                    'start': seg.start,
-                    'end': seg.end,
-                    'text': seg.text
-                })
-                progress.progress(min(1.0, (time.time() - t0) / est))
+            # Barra de progresso baseada no tempo real processado
+progress = progress  # já criado acima
+prog_text = st.empty()
+
+total_dur = float(getattr(info, 'duration', 0) or 0)
+
+for seg in segments_iter:
+    rows.append({
+        'start': seg.start,
+        'end': seg.end,
+        'text': seg.text
+    })
+
+    if total_dur > 0:
+        p = min(1.0, max(0.0, seg.end / total_dur))
+        prog_text.text(f"{p*100:.1f}% • {seg.end:.1f}s de {total_dur:.1f}s")
+    else:
+        # Fallback se a duração não for conhecida
+        p = min(1.0, (time.time() - t0) / est)
+        prog_text.text(f"{p*100:.1f}% • processando…")
+
+    progress.progress(p)
 
             df = pd.DataFrame(rows)
             st.session_state['results'] = {
