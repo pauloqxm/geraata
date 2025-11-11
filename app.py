@@ -4,18 +4,32 @@ from faster_whisper import WhisperModel
 import tempfile
 import os
 import librosa
-from pydub import AudioSegment
 import io
 import time
 import subprocess
 import sys
+import warnings
+warnings.filterwarnings("ignore")
 
-# Configuração da página
+# Configuração da página com carregamento otimizado
 st.set_page_config(
     page_title="Transcrição de Áudio - PT-BR",
     page_icon="🎙️",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
+
+# CSS para melhorar performance
+st.markdown("""
+<style>
+    .stProgress > div > div > div > div {
+        background-color: #1f77b4;
+    }
+    .reportview-container {
+        background-color: #f0f2f6;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # Título e descrição
 st.title("🎙️ Transcrição de Áudio em Português Brasileiro")
@@ -27,397 +41,308 @@ Faça upload de um arquivo de áudio e obtenha a transcrição automática em po
 def check_ffmpeg():
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-        subprocess.run(["ffprobe", "-version"], capture_output=True, check=True)
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
 
-# Verifica FFmpeg no início
+# Verifica FFmpeg
 ffmpeg_available = check_ffmpeg()
 
 if not ffmpeg_available:
-    st.warning("""
-    ⚠️ **FFmpeg não encontrado!**
-    
-    Para converter arquivos de áudio, é necessário instalar o FFmpeg:
-    
-    **Windows:**
-    ```bash
-    # Usando chocolatey
-    choco install ffmpeg
-    # Ou baixe do site oficial: https://ffmpeg.org/download.html
-    ```
-    
-    **macOS:**
-    ```bash
-    brew install ffmpeg
-    ```
-    
-    **Linux (Ubuntu/Debian):**
-    ```bash
-    sudo apt update && sudo apt install ffmpeg
-    ```
-    
-    **No Streamlit Cloud:** Adicione isso no arquivo `packages.txt`:
-    ```
-    ffmpeg
-    ```
-    """)
+    with st.sidebar:
+        st.warning("⚠️ FFmpeg não encontrado - usando método alternativo")
 
 # Sidebar com configurações
-st.sidebar.title("Configurações")
+with st.sidebar:
+    st.title("Configurações")
+    
+    # Seleção do modelo
+    model_size = st.selectbox(
+        "Tamanho do Modelo:",
+        ["tiny", "base", "small", "medium"],
+        index=1,
+        help="Modelos maiores são mais precisos mas mais lentos"
+    )
+    
+    # Configurações de transcrição
+    beam_size = st.slider("Beam Size", 1, 5, 2)
+    best_of = st.slider("Best Of", 1, 5, 2)
+    temperature = st.slider("Temperatura", 0.0, 1.0, 0.0, 0.1)
+    vad_filter = st.checkbox("Filtro VAD", value=True, help="Detecção de atividade de voz")
 
-# Seleção do modelo
-model_size = st.sidebar.selectbox(
-    "Tamanho do Modelo:",
-    ["tiny", "base", "small", "medium", "large-v2", "large-v3"],
-    index=2,
-    help="Modelos maiores são mais precisos mas mais lentos"
-)
-
-# Configurações de transcrição
-beam_size = st.sidebar.slider("Beam Size", 1, 10, 5)
-best_of = st.sidebar.slider("Best Of", 1, 10, 5)
-temperature = st.sidebar.slider("Temperatura", 0.0, 1.0, 0.0, 0.1)
-vad_filter = st.sidebar.checkbox("Filtro VAD", value=True, help="Detecção de atividade de voz")
-
-# Função para carregar o modelo
-@st.cache_resource
+# Função para carregar o modelo com fallback
+@st.cache_resource(show_spinner=False)
 def load_model(model_size):
     try:
-        # Use GPU se disponível, caso contrário use CPU
-        try:
-            import torch
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            compute_type = "float16" if device == "cuda" else "int8"
-        except:
+        # Limita o uso de memória
+        import torch
+        if torch.cuda.is_available():
+            device = "cuda"
+            compute_type = "float16"
+            # Limita o uso de VRAM
+            torch.cuda.set_per_process_memory_fraction(0.8)
+        else:
             device = "cpu"
             compute_type = "int8"
         
-        st.sidebar.info(f"Usando: {device.upper()}")
+        # Usa modelos menores se houver limitação de memória
+        if model_size in ["large-v2", "large-v3"] and device == "cpu":
+            model_size = "medium"
+            st.sidebar.info("Usando modelo medium (large requer muita RAM)")
         
         model = WhisperModel(
             model_size,
             device=device,
-            compute_type=compute_type
+            compute_type=compute_type,
+            download_root="./models"
         )
         return model
     except Exception as e:
-        st.error(f"Erro ao carregar o modelo: {e}")
+        st.error(f"Erro ao carregar modelo {model_size}: {str(e)}")
+        # Tenta carregar modelo menor como fallback
+        if model_size != "tiny":
+            st.info("Tentando carregar modelo tiny como fallback...")
+            try:
+                model = WhisperModel(
+                    "tiny",
+                    device="cpu",
+                    compute_type="int8"
+                )
+                return model
+            except:
+                pass
         return None
 
-# Função alternativa para converter áudio usando librosa (quando FFmpeg não está disponível)
-def convert_audio_librosa(input_file, output_path):
-    """Converte áudio usando librosa quando FFmpeg não está disponível"""
+# Função otimizada para converter áudio
+def convert_audio_optimized(_uploaded_file, progress_callback=None):
+    """Converte áudio de forma otimizada"""
     try:
-        # Se for um arquivo upload do Streamlit
-        if hasattr(input_file, 'read'):
-            audio_data, sample_rate = librosa.load(io.BytesIO(input_file.read()), sr=16000, mono=True)
-        else:
-            audio_data, sample_rate = librosa.load(input_file, sr=16000, mono=True)
+        if progress_callback:
+            progress_callback(10, "📥 Lendo arquivo...")
         
-        # Salva o arquivo usando soundfile
+        # Lê o arquivo diretamente com librosa (mais leve)
+        audio_data, original_sr = librosa.load(
+            io.BytesIO(_uploaded_file.read()),
+            sr=None,
+            mono=True
+        )
+        
+        if progress_callback:
+            progress_callback(40, "🔧 Convertendo amostragem...")
+        
+        # Converte para 16kHz se necessário
+        if original_sr != 16000:
+            audio_data = librosa.resample(audio_data, orig_sr=original_sr, target_sr=16000)
+        
+        if progress_callback:
+            progress_callback(70, "💾 Salvando arquivo...")
+        
+        # Salva como WAV temporário
         import soundfile as sf
-        sf.write(output_path, audio_data, sample_rate)
-        return output_path
+        temp_path = tempfile.mktemp(suffix=".wav")
+        sf.write(temp_path, audio_data, 16000)
+        
+        if progress_callback:
+            progress_callback(100, "✅ Conversão concluída!")
+        
+        return temp_path
+        
     except Exception as e:
-        st.error(f"Erro na conversão com librosa: {e}")
+        st.error(f"Erro na conversão: {str(e)}")
         return None
 
-# Função para converter áudio para formato compatível
-def convert_audio(input_file, output_format="wav", progress_bar=None, status_text=None):
-    """Converte áudio para formato WAV com taxa de amostragem compatível"""
+# Função otimizada para transcrição
+def transcribe_audio_optimized(_model, _audio_path, progress_callback=None):
+    """Transcreve áudio de forma otimizada"""
     try:
-        if status_text:
-            status_text.text("📥 Lendo arquivo de áudio...")
+        if progress_callback:
+            progress_callback(0, "🎯 Iniciando transcrição...")
         
-        # Se FFmpeg não estiver disponível, usa librosa
-        if not ffmpeg_available:
-            if status_text:
-                status_text.text("🔄 Convertendo com librosa (FFmpeg não disponível)...")
-            
-            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{output_format}") as temp_file:
-                output_path = temp_file.name
-            
-            result_path = convert_audio_librosa(input_file, output_path)
-            
-            if progress_bar:
-                progress_bar.progress(100)
-            
-            if status_text:
-                status_text.text("✅ Conversão concluída com librosa!")
-            
-            return result_path
-        
-        # Se FFmpeg estiver disponível, usa pydub (mais robusto)
-        if hasattr(input_file, 'read'):
-            if progress_bar:
-                progress_bar.progress(10)
-            # Reinicia a posição do arquivo
-            input_file.seek(0)
-            audio = AudioSegment.from_file(io.BytesIO(input_file.read()))
-        else:
-            audio = AudioSegment.from_file(input_file)
-        
-        if progress_bar:
-            progress_bar.progress(30)
-        
-        if status_text:
-            status_text.text("🔄 Convertendo para mono e 16kHz...")
-        
-        # Converte para mono e 16kHz (recomendado para Whisper)
-        audio = audio.set_channels(1)
-        audio = audio.set_frame_rate(16000)
-        
-        if progress_bar:
-            progress_bar.progress(60)
-        
-        if status_text:
-            status_text.text("💾 Salvando arquivo convertido...")
-        
-        # Salva em arquivo temporário
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{output_format}") as temp_file:
-            audio.export(temp_file.name, format=output_format)
-        
-        if progress_bar:
-            progress_bar.progress(100)
-        
-        if status_text:
-            status_text.text("✅ Conversão concluída!")
-            
-        return temp_file.name
-    except Exception as e:
-        st.error(f"Erro na conversão do áudio: {e}")
-        return None
-
-# Função para transcrever áudio com progresso
-def transcribe_audio(model, audio_path, progress_bar=None, status_text=None):
-    """Transcreve o áudio usando faster-whisper"""
-    try:
-        if status_text:
-            status_text.text("🎯 Iniciando transcrição...")
-        
-        segments, info = model.transcribe(
-            audio_path,
+        segments, info = _model.transcribe(
+            _audio_path,
             language="pt",
             beam_size=beam_size,
             best_of=best_of,
             temperature=temperature,
-            vad_filter=vad_filter
+            vad_filter=vad_filter,
+            without_timestamps=False
         )
         
-        if status_text:
-            status_text.text("📝 Processando segmentos de áudio...")
+        if progress_callback:
+            progress_callback(30, "📝 Processando segmentos...")
         
-        # Coleta todos os segmentos
+        # Processa segmentos em lotes para evitar memory leak
         transcriptions = []
-        segments_list = list(segments)
-        total_segments = len(segments_list)
+        batch_size = 10
+        current_batch = []
         
-        if progress_bar:
-            progress_bar.progress(0)
-        
-        for i, segment in enumerate(segments_list):
-            transcriptions.append({
+        for i, segment in enumerate(segments):
+            current_batch.append({
                 'start': segment.start,
                 'end': segment.end,
-                'text': segment.text
+                'text': segment.text.strip()
             })
             
-            if progress_bar and total_segments > 0:
-                progress = (i + 1) / total_segments
-                progress_bar.progress(progress)
-                
-            if status_text and total_segments > 0:
-                status_text.text(f"📝 Transcrevendo segmento {i+1}/{total_segments}...")
+            # Atualiza progresso a cada lote
+            if i % batch_size == 0 and progress_callback:
+                progress = 30 + min(60, (i / 100) * 60)
+                progress_callback(progress, f"📝 Processando... {i} segmentos")
         
-        if status_text:
-            status_text.text("✅ Transcrição concluída!")
-            
+        transcriptions = current_batch
+        
+        if progress_callback:
+            progress_callback(100, "✅ Transcrição concluída!")
+        
         return transcriptions, info
+        
     except Exception as e:
-        st.error(f"Erro na transcrição: {e}")
+        st.error(f"Erro na transcrição: {str(e)}")
         return None, None
 
 # Interface principal
 uploaded_file = st.file_uploader(
-    "Faça upload do arquivo de áudio",
-    type=['wav', 'mp3', 'm4a', 'ogg', 'flac', 'aac', 'webm'],
-    help="Formatos suportados: WAV, MP3, M4A, OGG, FLAC, AAC, WEBM"
+    "Faça upload do arquivo de áudio (máx. 50MB)",
+    type=['wav', 'mp3', 'm4a'],
+    help="Formatos suportados: WAV, MP3, M4A. Arquivos menores processam mais rápido."
 )
 
-# Carrega o modelo
-with st.spinner("Carregando modelo de transcrição..."):
-    model = load_model(model_size)
+# Limita tamanho do arquivo
+if uploaded_file and uploaded_file.size > 50 * 1024 * 1024:
+    st.error("⚠️ Arquivo muito grande! Por favor, use arquivos menores que 50MB.")
+    st.stop()
 
-if model is not None and uploaded_file is not None:
-    # Mostra informações do arquivo
+# Carrega o modelo apenas quando necessário
+if uploaded_file is not None:
+    with st.spinner("🔄 Carregando modelo de transcrição..."):
+        model = load_model(model_size)
+    
+    if model is None:
+        st.error("❌ Não foi possível carregar o modelo de transcrição.")
+        st.stop()
+
+# Processamento principal
+if uploaded_file is not None and model is not None:
+    # Informações do arquivo
     st.subheader("📄 Informações do Arquivo")
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         st.metric("Nome", uploaded_file.name)
     with col2:
-        st.metric("Tipo", uploaded_file.type.split('/')[-1].upper())
-    with col3:
-        st.metric("Tamanho", f"{uploaded_file.size / 1024 / 1024:.2f} MB")
+        st.metric("Tamanho", f"{uploaded_file.size / 1024 / 1024:.1f} MB")
     
-    # Aviso sobre FFmpeg se necessário
-    if not ffmpeg_available and not uploaded_file.name.lower().endswith('.wav'):
-        st.warning("""
-        ⚠️ **FFmpeg não encontrado - usando método alternativo**
+    # Botão de transcrição
+    if st.button("🎯 Iniciar Transcrição", type="primary", use_container_width=True):
         
-        A conversão de áudio pode ser mais lenta e alguns formatos podem não funcionar perfeitamente.
-        Para melhor experiência, instale o FFmpeg.
-        """)
-    
-    # Botão para iniciar transcrição
-    if st.button("🎯 Iniciar Transcrição", type="primary"):
-        # Container para progresso
-        progress_container = st.container()
-        status_container = st.container()
+        # Containers para progresso
+        progress_placeholder = st.empty()
+        status_placeholder = st.empty()
         
-        with progress_container:
-            st.subheader("📊 Progresso do Processamento")
-            overall_progress = st.progress(0)
-            conversion_progress = st.progress(0)
-            transcription_progress = st.progress(0)
-            status_text = st.empty()
+        def update_progress(progress, message):
+            with progress_placeholder:
+                st.progress(progress, text=message)
+            status_placeholder.text(message)
         
         try:
-            # Atualiza progresso geral
-            overall_progress.progress(10)
-            status_text.text("📥 Preparando arquivo...")
+            # Fase 1: Conversão
+            update_progress(0, "🔄 Iniciando conversão de áudio...")
+            audio_path = convert_audio_optimized(uploaded_file, update_progress)
             
-            # Salva arquivo temporariamente
-            with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{uploaded_file.name}") as tmp_file:
-                tmp_file.write(uploaded_file.getvalue())
-                temp_audio_path = tmp_file.name
-            
-            overall_progress.progress(20)
-            
-            # Sempre converte o áudio para garantir compatibilidade
-            status_text.text("🔄 Convertendo formato de áudio...")
-            converted_path = convert_audio(
-                uploaded_file,  # Passa o arquivo original
-                progress_bar=conversion_progress,
-                status_text=status_text
-            )
-            
-            if converted_path:
-                audio_path = converted_path
-                overall_progress.progress(50)
-            else:
-                st.error("Erro na conversão do áudio")
-                os.unlink(temp_audio_path)
+            if not audio_path:
+                st.error("❌ Falha na conversão do áudio")
                 st.stop()
             
-            # Transcreve o áudio
-            status_text.text("🎯 Iniciando transcrição...")
+            # Fase 2: Transcrição
             start_time = time.time()
-            
-            segments, info = transcribe_audio(
-                model, 
-                audio_path,
-                progress_bar=transcription_progress,
-                status_text=status_text
-            )
-            
+            segments, info = transcribe_audio_optimized(model, audio_path, update_progress)
             end_time = time.time()
-            overall_progress.progress(100)
             
-            # Limpa arquivos temporários
-            if os.path.exists(temp_audio_path):
-                os.unlink(temp_audio_path)
-            if os.path.exists(converted_path):
-                os.unlink(converted_path)
-        
-        except Exception as e:
-            status_text.text("❌ Erro no processamento!")
-            st.error(f"Erro durante o processamento: {e}")
-            # Limpeza em caso de erro
-            if 'temp_audio_path' in locals() and os.path.exists(temp_audio_path):
-                os.unlink(temp_audio_path)
-            if 'converted_path' in locals() and os.path.exists(converted_path):
-                os.unlink(converted_path)
-            st.stop()
-        
-        if segments and info:
-            # Mostra estatísticas
-            st.success(f"✅ Transcrição concluída em {end_time - start_time:.2f} segundos!")
+            # Limpeza
+            if os.path.exists(audio_path):
+                os.unlink(audio_path)
             
+            if not segments:
+                st.error("❌ Falha na transcrição do áudio")
+                st.stop()
+            
+            # Resultados
+            st.success(f"✅ Transcrição concluída em {end_time - start_time:.1f} segundos!")
+            
+            # Estatísticas
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("Duração do Áudio", f"{info.duration:.2f}s")
+                st.metric("Duração", f"{info.duration:.1f}s")
             with col2:
-                st.metric("Idioma Detectado", info.language.upper())
+                st.metric("Idioma", info.language.upper())
             with col3:
-                st.metric("Confiança do Idioma", f"{info.language_probability*100:.1f}%")
+                st.metric("Confiança", f"{info.language_probability*100:.0f}%")
             
-            # Exibe a transcrição completa
+            # Transcrição completa
             st.subheader("📝 Transcrição Completa")
-            full_text = " ".join([segment['text'] for segment in segments])
-            st.text_area("Texto transcrito:", full_text, height=200, key="full_text")
+            full_text = " ".join(segment['text'] for segment in segments)
+            st.text_area("Texto transcrito:", full_text, height=150, key="transcription")
             
-            # Exibe segmentos com timestamps
-            st.subheader("⏱️ Transcrição com Timestamps")
-            for i, segment in enumerate(segments, 1):
-                with st.expander(f"Segmento {i} - {segment['start']:.2f}s a {segment['end']:.2f}s"):
+            # Segmentos com timestamps
+            st.subheader("⏱️ Segmentos com Timestamps")
+            for i, segment in enumerate(segments[:20]):  # Limita a 20 segmentos para performance
+                with st.expander(f"Segmento {i+1} - {segment['start']:.1f}s a {segment['end']:.1f}s"):
                     st.write(segment['text'])
             
-            # Opção para download
-            st.subheader("💾 Download da Transcrição")
+            if len(segments) > 20:
+                st.info(f"📋 Mostrando os primeiros 20 de {len(segments)} segmentos")
+            
+            # Download
+            st.subheader("💾 Download")
             col1, col2 = st.columns(2)
             
             with col1:
-                # Download como texto simples
                 st.download_button(
-                    label="📥 Baixar como TXT",
-                    data=full_text,
+                    "📥 Baixar TXT",
+                    full_text,
                     file_name=f"transcricao_{uploaded_file.name.split('.')[0]}.txt",
-                    mime="text/plain"
+                    use_container_width=True
                 )
             
             with col2:
-                # Download com timestamps
-                timestamp_text = ""
-                for segment in segments:
-                    timestamp_text += f"[{segment['start']:.2f}s - {segment['end']:.2f}s] {segment['text']}\n"
-                
-                st.download_button(
-                    label="⏱️ Baixar com Timestamps",
-                    data=timestamp_text,
-                    file_name=f"transcricao_timestamps_{uploaded_file.name.split('.')[0]}.txt",
-                    mime="text/plain"
+                timestamp_text = "\n".join(
+                    f"[{s['start']:.1f}s-{s['end']:.1f}s] {s['text']}" 
+                    for s in segments
                 )
+                st.download_button(
+                    "⏱️ Baixar com Timestamps",
+                    timestamp_text,
+                    file_name=f"transcricao_timestamps_{uploaded_file.name.split('.')[0]}.txt",
+                    use_container_width=True
+                )
+                
+        except Exception as e:
+            st.error(f"❌ Erro durante o processamento: {str(e)}")
+            st.info("💡 Dica: Tente usar um arquivo menor ou modelo tiny")
 
-# Seção de instruções
-with st.expander("ℹ️ Instruções de Uso"):
+# Instruções
+with st.expander("📖 Instruções de Uso"):
     st.markdown("""
-    ### Como usar:
-    1. **Faça upload** de um arquivo de áudio nos formatos suportados
-    2. **Ajuste as configurações** na barra lateral se necessário
-    3. **Clique em 'Iniciar Transcrição'** para processar o áudio
-    4. **Acompanhe o progresso** nas barras de progresso
-    5. **Visualize e baixe** o resultado
-    
-    ### Requisitos:
-    - **FFmpeg** (recomendado): Para melhor compatibilidade com formatos de áudio
-    - **Sem FFmpeg**: Funciona com métodos alternativos, mas pode ser mais limitado
-    
-    ### Dicas:
-    - Para melhor precisão, use áudios com boa qualidade de áudio
-    - Modelos maiores ("medium", "large") são mais precisos mas mais lentos
-    - O filtro VAD ajuda a remover silêncios desnecessários
-    - Arquivos WAV geralmente têm melhor desempenho
+    **Como usar:**
+    1. Faça upload de um arquivo de áudio (até 50MB)
+    2. Ajuste as configurações na sidebar se necessário
+    3. Clique em 'Iniciar Transcrição'
+    4. Aguarde o processamento
+    5. Visualize e baixe o resultado
+
+    **Dicas para melhor performance:**
+    - Use arquivos WAV quando possível
+    - Modelos menores (tiny, base) são mais rápidos
+    - Arquivos curtos (< 10min) processam mais rápido
+    - Evite múltiplas transcrições simultâneas
+
+    **Formatos suportados:** WAV, MP3, M4A
     """)
 
 # Rodapé
 st.markdown("---")
 st.markdown(
-    "Desenvolvido com Streamlit e Faster-Whisper | "
-    "Modelos de transcrição por OpenAI Whisper"
+    "Desenvolvido com Streamlit + Faster-Whisper • "
+    "[Problemas? Reduza o tamanho do arquivo ou use modelo tiny]"
 )
 
-# Mensagem se nenhum arquivo foi carregado
 if uploaded_file is None:
-    st.info("👆 Faça upload de um arquivo de áudio para começar a transcrição!")
+    st.info("👆 Faça upload de um arquivo de áudio para começar!")
