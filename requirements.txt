@@ -5,4 +5,3 @@ pydub
 numpy
 librosa
 soundfile
-ffmpeg-python
